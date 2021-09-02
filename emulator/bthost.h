@@ -27,6 +27,8 @@ typedef void (*bthost_debug_func_t)(const char *str, void *user_data);
 typedef void (*bthost_destroy_func_t)(void *user_data);
 bool bthost_set_debug(struct bthost *bthost, bthost_debug_func_t callback,
 			void *user_data, bthost_destroy_func_t destroy);
+void bthost_debug(struct bthost *bthost, const char *format, ...)
+					__attribute__((format(printf, 2, 3)));
 
 void bthost_set_send_handler(struct bthost *bthost, bthost_send_func handler,
 							void *user_data);
@@ -80,6 +82,7 @@ void bthost_set_adv_enable(struct bthost *bthost, uint8_t enable);
 
 void bthost_set_ext_adv_data(struct bthost *bthost, const uint8_t *data,
 								uint8_t len);
+void bthost_set_ext_adv_params(struct bthost *bthost);
 void bthost_set_ext_adv_enable(struct bthost *bthost, uint8_t enable);
 
 void bthost_write_ssp_mode(struct bthost *bthost, uint8_t mode);

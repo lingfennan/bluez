@@ -580,6 +580,7 @@ static void gatt_cache_cleanup(struct btd_device *device)
 
 	bt_gatt_client_cancel_all(device->client);
 	gatt_db_clear(device->db);
+	device->le_state.svc_resolved = false;
 }
 
 static void gatt_client_cleanup(struct btd_device *device)
@@ -1929,6 +1930,56 @@ static int service_prio_cmp(gconstpointer a, gconstpointer b)
 	return p2->priority - p1->priority;
 }
 
+bool btd_device_all_services_allowed(struct btd_device *dev)
+{
+	GSList *l;
+	struct btd_adapter *adapter = dev->adapter;
+	struct btd_service *service;
+	struct btd_profile *profile;
+
+	for (l = dev->services; l != NULL; l = g_slist_next(l)) {
+		service = l->data;
+		profile = btd_service_get_profile(service);
+
+		if (!profile || !profile->auto_connect)
+			continue;
+
+		if (!btd_adapter_is_uuid_allowed(adapter, profile->remote_uuid))
+			return false;
+	}
+
+	return true;
+}
+
+void btd_device_update_allowed_services(struct btd_device *dev)
+{
+	struct btd_adapter *adapter = dev->adapter;
+	struct btd_service *service;
+	struct btd_profile *profile;
+	GSList *l;
+	bool is_allowed;
+	char addr[18];
+
+	/* If service discovery is ongoing, let the service discovery complete
+	 * callback call this function.
+	 */
+	if (dev->browse) {
+		ba2str(&dev->bdaddr, addr);
+		DBG("service discovery of %s is ongoing. Skip updating allowed "
+							"services", addr);
+		return;
+	}
+
+	for (l = dev->services; l != NULL; l = g_slist_next(l)) {
+		service = l->data;
+		profile = btd_service_get_profile(service);
+
+		is_allowed = btd_adapter_is_uuid_allowed(adapter,
+							profile->remote_uuid);
+		btd_service_set_allowed(service, is_allowed);
+	}
+}
+
 static GSList *create_pending_list(struct btd_device *dev, const char *uuid)
 {
 	struct btd_service *service;
@@ -1937,9 +1988,14 @@ static GSList *create_pending_list(struct btd_device *dev, const char *uuid)
 
 	if (uuid) {
 		service = find_connectable_service(dev, uuid);
-		if (service)
+
+		if (!service)
+			return dev->pending;
+
+		if (btd_service_is_allowed(service))
 			return g_slist_prepend(dev->pending, service);
 
+		info("service %s is blocked", uuid);
 		return dev->pending;
 	}
 
@@ -1949,6 +2005,11 @@ static GSList *create_pending_list(struct btd_device *dev, const char *uuid)
 
 		if (!p->auto_connect)
 			continue;
+
+		if (!btd_service_is_allowed(service)) {
+			info("service %s is blocked", p->remote_uuid);
+			continue;
+		}
 
 		if (g_slist_find(dev->pending, service))
 			continue;
@@ -2633,6 +2694,9 @@ static void device_svc_resolved(struct btd_device *dev, uint8_t browse_type,
 							dev->svc_callbacks);
 		g_free(cb);
 	}
+
+	btd_device_update_allowed_services(dev);
+	device_resolved_drivers(dev->adapter, dev);
 }
 
 static struct bonding_req *bonding_request_new(DBusMessage *msg,
@@ -2963,6 +3027,14 @@ bool btd_device_is_connected(struct btd_device *dev)
 	return dev->bredr_state.connected || dev->le_state.connected;
 }
 
+static void clear_temporary_timer(struct btd_device *dev)
+{
+	if (dev->temporary_timer) {
+		timeout_remove(dev->temporary_timer);
+		dev->temporary_timer = 0;
+	}
+}
+
 void device_add_connection(struct btd_device *dev, uint8_t bdaddr_type)
 {
 	struct bearer_state *state = get_state(dev, bdaddr_type);
@@ -2991,10 +3063,7 @@ void device_add_connection(struct btd_device *dev, uint8_t bdaddr_type)
 		return;
 
 	/* Remove temporary timer while connected */
-	if (dev->temporary_timer) {
-		timeout_remove(dev->temporary_timer);
-		dev->temporary_timer = 0;
-	}
+	clear_temporary_timer(dev);
 
 	g_dbus_emit_property_changed(dbus_conn, dev->path, DEVICE_INTERFACE,
 								"Connected");
@@ -3060,6 +3129,9 @@ void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type)
 		return;
 
 	device_update_last_seen(device, bdaddr_type);
+
+	g_slist_free_full(device->eir_uuids, g_free);
+	device->eir_uuids = NULL;
 
 	g_dbus_emit_property_changed(dbus_conn, device->path,
 						DEVICE_INTERFACE, "Connected");
@@ -4280,6 +4352,17 @@ static bool device_disappeared(gpointer user_data)
 	return FALSE;
 }
 
+static void set_temporary_timer(struct btd_device *dev, unsigned int timeout)
+{
+	clear_temporary_timer(dev);
+
+	if (!timeout)
+		return;
+
+	dev->temporary_timer = timeout_add_seconds(timeout, device_disappeared,
+								dev, NULL);
+}
+
 void device_update_last_seen(struct btd_device *device, uint8_t bdaddr_type)
 {
 	if (bdaddr_type == BDADDR_BREDR)
@@ -4291,12 +4374,7 @@ void device_update_last_seen(struct btd_device *device, uint8_t bdaddr_type)
 		return;
 
 	/* Restart temporary timer */
-	if (device->temporary_timer)
-		timeout_remove(device->temporary_timer);
-
-	device->temporary_timer = timeout_add_seconds(btd_opts.tmpto,
-							device_disappeared,
-							device, NULL);
+	set_temporary_timer(device, btd_opts.tmpto);
 }
 
 /* It is possible that we have two device objects for the same device in
@@ -4437,6 +4515,7 @@ static void device_remove_stored(struct btd_device *device)
 	key_file = g_key_file_new();
 	g_key_file_load_from_file(key_file, filename, 0, NULL);
 	g_key_file_remove_group(key_file, "ServiceRecords", NULL);
+	g_key_file_remove_group(key_file, "Attributes", NULL);
 
 	data = g_key_file_to_data(key_file, &length, NULL);
 	if (length > 0) {
@@ -4487,10 +4566,7 @@ void device_remove(struct btd_device *device, gboolean remove_stored)
 		disconnect_all(device);
 	}
 
-	if (device->temporary_timer > 0) {
-		timeout_remove(device->temporary_timer);
-		device->temporary_timer = 0;
-	}
+	clear_temporary_timer(device);
 
 	if (device->store_id > 0) {
 		g_source_remove(device->store_id);
@@ -4616,8 +4692,11 @@ static struct btd_service *probe_service(struct btd_device *device,
 		return NULL;
 
 	l = find_service_with_profile(device->services, profile);
+	/* If the service already exists, return NULL so that it won't be added
+	 * to the device->services.
+	 */
 	if (l)
-		return l->data;
+		return NULL;
 
 	service = service_create(device, profile);
 
@@ -4981,6 +5060,7 @@ static void search_cb(sdp_list_t *recs, int err, gpointer user_data)
 {
 	struct browse_req *req = user_data;
 	struct btd_device *device = req->device;
+	DBusMessage *reply;
 	GSList *primaries;
 	char addr[18];
 
@@ -5024,6 +5104,17 @@ static void search_cb(sdp_list_t *recs, int err, gpointer user_data)
 						DEVICE_INTERFACE, "UUIDs");
 
 send_reply:
+	/* If SDP search failed during an ongoing connection request, we should
+	 * reply to D-Bus method call.
+	 */
+	if (err < 0 && device->connect) {
+		DBG("SDP failed during connection");
+		reply = btd_error_failed(device->connect, strerror(-err));
+		g_dbus_send_message(dbus_conn, reply);
+		dbus_message_unref(device->connect);
+		device->connect = NULL;
+	}
+
 	device_svc_resolved(device, BROWSE_SDP, BDADDR_BREDR, err);
 }
 
@@ -5217,6 +5308,13 @@ static void gatt_client_init(struct btd_device *device)
 	}
 
 	btd_gatt_client_connected(device->client_dbus);
+
+	/* Only initiate EATT connection when acting as initiator, as acceptor
+	 * it shall be triggered only when ready to avoid possible clashes where
+	 * both sides attempt to connection at same time.
+	 */
+	if (device->connect)
+		btd_gatt_client_eatt_connect(device->client_dbus);
 }
 
 static void gatt_server_init(struct btd_device *device,
@@ -5689,11 +5787,6 @@ void btd_device_set_temporary(struct btd_device *device, bool temporary)
 
 	device->temporary = temporary;
 
-	if (device->temporary_timer) {
-		timeout_remove(device->temporary_timer);
-		device->temporary_timer = 0;
-	}
-
 	if (temporary) {
 		if (device->bredr)
 			adapter_whitelist_remove(device->adapter, device);
@@ -5702,11 +5795,10 @@ void btd_device_set_temporary(struct btd_device *device, bool temporary)
 			device->disable_auto_connect = TRUE;
 			device_set_auto_connect(device, FALSE);
 		}
-		device->temporary_timer = timeout_add_seconds(btd_opts.tmpto,
-							device_disappeared,
-							device, NULL);
+		set_temporary_timer(device, btd_opts.tmpto);
 		return;
-	}
+	} else
+		clear_temporary_timer(device);
 
 	if (device->bredr)
 		adapter_whitelist_add(device->adapter, device);

@@ -2681,8 +2681,8 @@ struct bt_hci_cis_params_test {
 	uint8_t  nse;
 	uint16_t m_sdu;
 	uint16_t s_sdu;
-	uint8_t  m_pdu;
-	uint8_t  s_pdu;
+	uint16_t m_pdu;
+	uint16_t s_pdu;
 	uint8_t  m_phy;
 	uint8_t  s_phy;
 	uint8_t  m_bn;
@@ -3656,7 +3656,9 @@ struct bt_hci_evt_le_req_peer_sca_complete {
 #define BT_HCI_ERR_UNSUPPORTED_FEATURE		0x11
 #define BT_HCI_ERR_INVALID_PARAMETERS		0x12
 #define BT_HCI_ERR_UNSPECIFIED_ERROR		0x1f
+#define BT_HCI_ERR_ADV_TIMEOUT                 0x3c
 #define BT_HCI_ERR_CONN_FAILED_TO_ESTABLISH	0x3e
+#define BT_HCI_ERR_UNKNOWN_ADVERTISING_ID	0x42
 
 struct bt_l2cap_hdr {
 	uint16_t len;

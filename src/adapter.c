@@ -260,6 +260,8 @@ struct btd_adapter {
 
 	struct btd_battery_provider_manager *battery_provider_manager;
 
+	GHashTable *allowed_uuid_set;	/* Set of allowed service UUIDs */
+
 	gboolean initialized;
 
 	GSList *pin_callbacks;
@@ -284,6 +286,7 @@ struct btd_adapter {
 	bool is_default;		/* true if adapter is default one */
 
 	bool le_simult_roles_supported;
+	bool quality_report_supported;
 };
 
 typedef enum {
@@ -559,7 +562,11 @@ static void settings_changed(struct btd_adapter *adapter, uint32_t settings)
 	if (changed_mask & MGMT_SETTING_DISCOVERABLE) {
 		g_dbus_emit_property_changed(dbus_conn, adapter->path,
 					ADAPTER_INTERFACE, "Discoverable");
-		store_adapter_info(adapter);
+		/* Only persist discoverable setting if it was not set
+		 * temporarily by discovery.
+		 */
+		if (!adapter->discovery_discoverable)
+			store_adapter_info(adapter);
 		btd_adv_manager_refresh(adapter->adv_manager);
 	}
 
@@ -1211,6 +1218,9 @@ void adapter_service_remove(struct btd_adapter *adapter, uint32_t handle)
 	remove_record_from_server(rec->handle);
 }
 
+static void adapter_add_device(struct btd_adapter *adapter,
+						struct btd_device *device);
+
 static struct btd_device *adapter_create_device(struct btd_adapter *adapter,
 						const bdaddr_t *bdaddr,
 						uint8_t bdaddr_type)
@@ -1221,8 +1231,7 @@ static struct btd_device *adapter_create_device(struct btd_adapter *adapter,
 	if (!device)
 		return NULL;
 
-	adapter->devices = g_slist_append(adapter->devices, device);
-
+	adapter_add_device(adapter, device);
 	return device;
 }
 
@@ -1249,6 +1258,9 @@ static void service_auth_cancel(struct service_auth *auth)
 	g_free(auth);
 }
 
+static void adapter_remove_device(struct btd_adapter *adapter,
+						struct btd_device *device);
+
 void btd_adapter_remove_device(struct btd_adapter *adapter,
 				struct btd_device *dev)
 {
@@ -1256,7 +1268,7 @@ void btd_adapter_remove_device(struct btd_adapter *adapter,
 
 	adapter->connect_list = g_slist_remove(adapter->connect_list, dev);
 
-	adapter->devices = g_slist_remove(adapter->devices, dev);
+	adapter_remove_device(adapter, dev);
 	btd_adv_monitor_device_remove(adapter->adv_monitor_manager, dev);
 
 	adapter->discovery_found = g_slist_remove(adapter->discovery_found,
@@ -2161,8 +2173,6 @@ static bool filters_equal(struct mgmt_cp_start_service_discovery *a,
 static int update_discovery_filter(struct btd_adapter *adapter)
 {
 	struct mgmt_cp_start_service_discovery *sd_cp;
-	GSList *l;
-
 
 	DBG("");
 
@@ -2172,17 +2182,24 @@ static int update_discovery_filter(struct btd_adapter *adapter)
 		return -ENOMEM;
 	}
 
-	for (l = adapter->discovery_list; l; l = g_slist_next(l)) {
-		struct discovery_client *client = l->data;
+	/* Only attempt to overwrite current discoverable setting when not
+	 * discoverable.
+	 */
+	if (!(adapter->current_settings & MGMT_OP_SET_DISCOVERABLE)) {
+		GSList *l;
 
-		if (!client->discovery_filter)
-			continue;
+		for (l = adapter->discovery_list; l; l = g_slist_next(l)) {
+			struct discovery_client *client = l->data;
 
-		if (client->discovery_filter->discoverable)
-			break;
+			if (!client->discovery_filter)
+				continue;
+
+			if (client->discovery_filter->discoverable) {
+				set_discovery_discoverable(adapter, true);
+				break;
+			}
+		}
 	}
-
-	set_discovery_discoverable(adapter, l ? true : false);
 
 	/*
 	 * If filters are equal, then don't update scan, except for when
@@ -2215,8 +2232,7 @@ static int discovery_stop(struct discovery_client *client)
 		return 0;
 	}
 
-	if (adapter->discovery_discoverable)
-		set_discovery_discoverable(adapter, false);
+	set_discovery_discoverable(adapter, false);
 
 	/*
 	 * In the idle phase of a discovery, there is no need to stop it
@@ -3480,6 +3496,93 @@ static DBusMessage *connect_device(DBusConnection *conn,
 	return NULL;
 }
 
+static void update_device_allowed_services(void *data, void *user_data)
+{
+	struct btd_device *device = data;
+
+	btd_device_update_allowed_services(device);
+}
+
+static void add_uuid_to_uuid_set(void *data, void *user_data)
+{
+	bt_uuid_t *uuid = data;
+	GHashTable *uuid_set = user_data;
+
+	if (!uuid) {
+		error("Found NULL in UUID allowed list");
+		return;
+	}
+
+	g_hash_table_add(uuid_set, uuid);
+}
+
+static guint bt_uuid_hash(gconstpointer key)
+{
+	const bt_uuid_t *uuid = key;
+	bt_uuid_t uuid_128;
+	uint64_t *val;
+
+	if (!uuid)
+		return 0;
+
+	bt_uuid_to_uuid128(uuid, &uuid_128);
+	val = (uint64_t *)&uuid_128.value.u128;
+
+	return g_int64_hash(val) ^ g_int64_hash(val+1);
+}
+
+static gboolean bt_uuid_equal(gconstpointer v1, gconstpointer v2)
+{
+	const bt_uuid_t *uuid1 = v1;
+	const bt_uuid_t *uuid2 = v2;
+
+	if (!uuid1 || !uuid2)
+		return !uuid1 && !uuid2;
+
+	return bt_uuid_cmp(uuid1, uuid2) == 0;
+}
+
+bool btd_adapter_set_allowed_uuids(struct btd_adapter *adapter,
+							struct queue *uuids)
+{
+	if (!adapter)
+		return false;
+
+	if (adapter->allowed_uuid_set)
+		g_hash_table_destroy(adapter->allowed_uuid_set);
+
+	adapter->allowed_uuid_set = g_hash_table_new(bt_uuid_hash,
+								bt_uuid_equal);
+	if (!adapter->allowed_uuid_set) {
+		btd_error(adapter->dev_id,
+					"Failed to allocate allowed_uuid_set");
+		return false;
+	}
+
+	queue_foreach(uuids, add_uuid_to_uuid_set, adapter->allowed_uuid_set);
+	g_slist_foreach(adapter->devices, update_device_allowed_services, NULL);
+
+	return true;
+}
+
+bool btd_adapter_is_uuid_allowed(struct btd_adapter *adapter,
+							const char *uuid_str)
+{
+	bt_uuid_t uuid;
+
+	if (!adapter || !adapter->allowed_uuid_set)
+		return true;
+
+	if (bt_string_to_uuid(&uuid, uuid_str)) {
+		btd_error(adapter->dev_id,
+				"Failed to parse UUID string '%s'", uuid_str);
+		return false;
+	}
+
+	return !g_hash_table_size(adapter->allowed_uuid_set) ||
+		g_hash_table_contains(adapter->allowed_uuid_set, &uuid);
+}
+
 static const GDBusMethodTable adapter_methods[] = {
 	{ GDBUS_ASYNC_METHOD("StartDiscovery", NULL, NULL, start_discovery) },
 	{ GDBUS_METHOD("SetDiscoveryFilter",
@@ -4213,6 +4316,7 @@ static void probe_devices(void *user_data)
 	struct btd_device *device = user_data;
 
 	device_probe_profiles(device, btd_device_get_uuids(device));
+	device_resolved_drivers(device_get_adapter(device), device);
 }
 
 static bool load_bredr_defaults(struct btd_adapter *adapter,
@@ -4567,7 +4671,7 @@ static void load_devices(struct btd_adapter *adapter)
 			goto free;
 
 		btd_device_set_temporary(device, false);
-		adapter->devices = g_slist_append(adapter->devices, device);
+		adapter_add_device(adapter, device);
 
 		/* TODO: register services from pre-loaded list of primaries */
 
@@ -4727,6 +4831,62 @@ void adapter_remove_profile(struct btd_adapter *adapter, gpointer p)
 
 	if (profile->adapter_remove)
 		profile->adapter_remove(profile, adapter);
+}
+
+static void device_added_drivers(struct btd_adapter *adapter,
+						struct btd_device *device)
+{
+	struct btd_adapter_driver *driver;
+	GSList *l;
+
+	for (l = adapter_drivers; l; l = l->next) {
+		driver = l->data;
+
+		if (driver->device_added)
+			driver->device_added(adapter, device);
+	}
+}
+
+static void device_removed_drivers(struct btd_adapter *adapter,
+						struct btd_device *device)
+{
+	struct btd_adapter_driver *driver;
+	GSList *l;
+
+	for (l = adapter_drivers; l; l = l->next) {
+		driver = l->data;
+
+		if (driver->device_removed)
+			driver->device_removed(adapter, device);
+	}
+}
+
+void device_resolved_drivers(struct btd_adapter *adapter,
+						struct btd_device *device)
+{
+	struct btd_adapter_driver *driver;
+	GSList *l;
+
+	for (l = adapter_drivers; l; l = l->next) {
+		driver = l->data;
+
+		if (driver->device_resolved)
+			driver->device_resolved(adapter, device);
+	}
+}
+
+static void adapter_add_device(struct btd_adapter *adapter,
+						struct btd_device *device)
+{
+	adapter->devices = g_slist_append(adapter->devices, device);
+	device_added_drivers(adapter, device);
+}
+
+static void adapter_remove_device(struct btd_adapter *adapter,
+						struct btd_device *device)
+{
+	adapter->devices = g_slist_remove(adapter->devices, device);
+	device_removed_drivers(adapter, device);
 }
 
 static void adapter_add_connection(struct btd_adapter *adapter,
@@ -5395,6 +5555,10 @@ static void adapter_free(gpointer user_data)
 	g_free(adapter->stored_alias);
 	g_free(adapter->current_alias);
 	free(adapter->modalias);
+
+	if (adapter->allowed_uuid_set)
+		g_hash_table_destroy(adapter->allowed_uuid_set);
+
 	g_free(adapter);
 }
 
@@ -6346,8 +6510,10 @@ static void adapter_remove(struct btd_adapter *adapter)
 	g_slist_free(adapter->connect_list);
 	adapter->connect_list = NULL;
 
-	for (l = adapter->devices; l; l = l->next)
+	for (l = adapter->devices; l; l = l->next) {
+		device_removed_drivers(adapter, l->data);
 		device_remove(l->data, FALSE);
+	}
 
 	g_slist_free(adapter->devices);
 	adapter->devices = NULL;
@@ -6656,7 +6822,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 
 	dev = btd_adapter_find_device(adapter, bdaddr, bdaddr_type);
 	if (!dev) {
-		if (!discoverable) {
+		if (!discoverable && !matched_monitors) {
 			eir_data_free(&eir_data);
 			return;
 		}
@@ -6912,6 +7078,7 @@ static void adapter_stop(struct btd_adapter *adapter)
 	g_free(adapter->current_discovery_filter);
 	adapter->current_discovery_filter = NULL;
 
+	set_discovery_discoverable(adapter, false);
 	adapter->discovering = false;
 
 	while (adapter->connections) {
@@ -7017,6 +7184,11 @@ static gboolean process_auth_queue(gpointer user_data)
 		/* Wait services to be resolved before asking authorization */
 		if (auth->svc_id > 0)
 			return FALSE;
+
+		if (!btd_adapter_is_uuid_allowed(adapter, auth->uuid)) {
+			auth->cb(&err, auth->user_data);
+			goto next;
+		}
 
 		if (device_is_trusted(device) == TRUE) {
 			auth->cb(NULL, auth->user_data);
@@ -9216,6 +9388,123 @@ static bool set_blocked_keys(struct btd_adapter *adapter)
 						adapter, NULL);
 }
 
+#define EXP_FEAT(_uuid, _func) \
+{ \
+	.uuid = _uuid, \
+	.func = _func, \
+}
+
+/* d4992530-b9ec-469f-ab01-6c481c47da1c */
+static const uint8_t debug_uuid[16] = {
+	0x1c, 0xda, 0x47, 0x1c, 0x48, 0x6c, 0x01, 0xab,
+	0x9f, 0x46, 0xec, 0xb9, 0x30, 0x25, 0x99, 0xd4,
+};
+
+/* 671b10b5-42c0-4696-9227-eb28d1b049d6 */
+static const uint8_t le_simult_central_peripheral_uuid[16] = {
+	0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb, 0x27, 0x92,
+	0x96, 0x46, 0xc0, 0x42, 0xb5, 0x10, 0x1b, 0x67,
+};
+
+/* 330859bc-7506-492d-9370-9a6f0614037f */
+static const uint8_t quality_report_uuid[16] = {
+	0x7f, 0x03, 0x14, 0x06, 0x6f, 0x9a, 0x70, 0x93,
+	0x2d, 0x49, 0x06, 0x75, 0xbc, 0x59, 0x08, 0x33,
+};
+
+/* 15c0a148-c273-11ea-b3de-0242ac130004 */
+static const uint8_t rpa_resolution_uuid[16] = {
+	0x04, 0x00, 0x13, 0xac, 0x42, 0x02, 0xde, 0xb3,
+	0xea, 0x11, 0x73, 0xc2, 0x48, 0xa1, 0xc0, 0x15,
+};
+
+static void set_exp_debug_complete(uint8_t status, uint16_t len,
+					const void *param, void *user_data)
+{
+	if (status != 0)
+		error("Set Experimental Debug failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+	else
+		DBG("Experimental Debug successfully set");
+}
+
+static void exp_debug_func(struct btd_adapter *adapter, uint32_t flags)
+{
+	struct mgmt_cp_set_exp_feature cp;
+	uint8_t action = btd_opts.experimental ? 0x01 : 0x00;
+
+	/* If already set don't attempt to set it again */
+	if (action == (flags & BIT(0)))
+		return;
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(cp.uuid, debug_uuid, 16);
+	cp.action = action;
+
+	if (mgmt_send(adapter->mgmt, MGMT_OP_SET_EXP_FEATURE,
+			adapter->dev_id, sizeof(cp), &cp,
+			set_exp_debug_complete, adapter, NULL) > 0)
+		return;
+
+	btd_error(adapter->dev_id, "Failed to set exp debug");
+}
+
+static void le_simult_central_peripheral_func(struct btd_adapter *adapter,
+							uint32_t flags)
+{
+	adapter->le_simult_roles_supported = flags & 0x01;
+}
+
+static void quality_report_func(struct btd_adapter *adapter, uint32_t flags)
+{
+	adapter->quality_report_supported = le32_to_cpu(flags) & 0x01;
+
+	btd_info(adapter->dev_id, "quality_report_supported %d",
+			adapter->quality_report_supported);
+}
+
+static void set_rpa_resolution_complete(uint8_t status, uint16_t len,
+					const void *param, void *user_data)
+{
+	if (status != 0)
+		error("Set RPA Resolution failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+	else
+		DBG("RPA Resolution successfully set");
+}
+
+static void rpa_resolution_func(struct btd_adapter *adapter, uint32_t flags)
+{
+	struct mgmt_cp_set_exp_feature cp;
+	uint8_t action = btd_opts.experimental ? 0x01 : 0x00;
+
+	/* If already set don't attempt to set it again */
+	if (action == (flags & BIT(0)))
+		return;
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(cp.uuid, rpa_resolution_uuid, 16);
+	cp.action = action;
+
+	if (mgmt_send(adapter->mgmt, MGMT_OP_SET_EXP_FEATURE,
+			adapter->dev_id, sizeof(cp), &cp,
+			set_rpa_resolution_complete, adapter, NULL) > 0)
+		return;
+
+	btd_error(adapter->dev_id, "Failed to set RPA Resolution");
+}
+
+static const struct exp_feat {
+	const uint8_t *uuid;
+	void (*func)(struct btd_adapter *adapter, uint32_t flags);
+} exp_table[] = {
+	EXP_FEAT(debug_uuid, exp_debug_func),
+	EXP_FEAT(le_simult_central_peripheral_uuid,
+		 le_simult_central_peripheral_func),
+	EXP_FEAT(quality_report_uuid, quality_report_func),
+	EXP_FEAT(rpa_resolution_uuid, rpa_resolution_func),
+};
+
 static void read_exp_features_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -9239,19 +9528,24 @@ static void read_exp_features_complete(uint8_t status, uint16_t length,
 	}
 
 	feature_count = le16_to_cpu(rp->feature_count);
+
+	if (length < sizeof(*rp) + (sizeof(*rp->features) * feature_count)) {
+		btd_error(adapter->dev_id, "Response too small");
+		return;
+	}
+
 	for (i = 0; i < feature_count; ++i) {
+		size_t j;
 
-		/* 671b10b5-42c0-4696-9227-eb28d1b049d6 */
-		static const uint8_t le_simult_central_peripheral[16] = {
-			0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb, 0x27, 0x92,
-			0x96, 0x46, 0xc0, 0x42, 0xb5, 0x10, 0x1b, 0x67,
-		};
+		for (j = 0; j < ARRAY_SIZE(exp_table); j++) {
+			const struct exp_feat *feat = &exp_table[j];
 
-		if (memcmp(rp->features[i].uuid, le_simult_central_peripheral,
-				sizeof(le_simult_central_peripheral)) == 0) {
-			uint32_t flags = le32_to_cpu(rp->features[i].flags);
+			if (memcmp(rp->features[i].uuid, feat->uuid,
+					sizeof(rp->features[i].uuid)))
+				continue;
 
-			adapter->le_simult_roles_supported = flags & 0x01;
+			if (feat->func)
+				feat->func(adapter, rp->features[i].flags);
 		}
 	}
 }
@@ -9374,9 +9668,6 @@ static void read_info_complete(uint8_t status, uint16_t length,
 	if (btd_opts.fast_conn &&
 			(missing_settings & MGMT_SETTING_FAST_CONNECTABLE))
 		set_mode(adapter, MGMT_OP_SET_FAST_CONNECTABLE, 0x01);
-
-	if (btd_has_kernel_features(KERNEL_EXP_FEATURES))
-		read_exp_features(adapter);
 
 	err = adapter_register(adapter);
 	if (err < 0) {
@@ -9600,6 +9891,9 @@ static void index_added(uint16_t index, uint16_t length, const void *param,
 			"Unable to create new adapter for index %u", index);
 		return;
 	}
+
+	if (btd_has_kernel_features(KERNEL_EXP_FEATURES))
+		read_exp_features(adapter);
 
 	/*
 	 * Protect against potential two executions of read controller info.

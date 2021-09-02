@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 AC_PREREQ(2.60)
-AC_INIT(bluez, 5.56)
+AC_INIT(bluez, 5.61)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects color-tests silent-rules
 					tar-pax no-dist-gzip dist-xz])
@@ -265,8 +265,8 @@ AC_ARG_ENABLE([external_ell], AC_HELP_STRING([--enable-external-ell],
 				[enable external Embedded Linux library]),
 					[enable_external_ell=${enableval}])
 if (test "${enable_external_ell}" = "yes"); then
-	PKG_CHECK_MODULES(ELL, ell >= 0.37, dummy=yes,
-		AC_MSG_ERROR(Embedded Linux library >= 0.37 is required))
+	PKG_CHECK_MODULES(ELL, ell >= 0.39, dummy=yes,
+		AC_MSG_ERROR(Embedded Linux library >= 0.39 is required))
 	AC_SUBST(ELL_CFLAGS)
 	AC_SUBST(ELL_LIBS)
 fi
@@ -323,10 +323,17 @@ AC_ARG_ENABLE(datafiles, AC_HELP_STRING([--disable-datafiles],
 					[enable_datafiles=${enableval}])
 AM_CONDITIONAL(DATAFILES, test "${enable_datafiles}" != "no")
 
-AC_ARG_ENABLE(manpages, AC_HELP_STRING([--enable-manpages],
-			[enable building of manual pages]),
+AC_ARG_ENABLE(manpages, AC_HELP_STRING([--disable-manpages],
+			[disable building of manual pages]),
 					[enable_manpages=${enableval}])
-AM_CONDITIONAL(MANPAGES, test "${enable_manpages}" = "yes")
+if (test "${enable_manpages}" != "no"); then
+	AC_CHECK_PROGS(RST2MAN, [rst2man rst2man.py], "no")
+	if (test "${RST2MAN}" = "no" ); then
+		AC_MSG_ERROR([rst2man is required])
+	fi
+fi
+AM_CONDITIONAL(MANPAGES, test "${enable_manpages}" != "no")
+AM_CONDITIONAL(RUN_RST2MAN, test "${enable_manpages}" != "no" && test "${RST2MAN}" != "no")
 
 AC_ARG_ENABLE(testing, AC_HELP_STRING([--enable-testing],
 			[enable testing tools]),
@@ -357,6 +364,10 @@ AC_ARG_ENABLE(logger, AC_HELP_STRING([--enable-logger],
 		[enable HCI logger service]), [enable_logger=${enableval}])
 AM_CONDITIONAL(LOGGER, test "${enable_logger}" = "yes")
 
+AC_ARG_ENABLE(admin, AC_HELP_STRING([--enable-admin],
+		[enable admin policy plugin]), [enable_admin=${enableval}])
+AM_CONDITIONAL(ADMIN, test "${enable_admin}" = "yes")
+
 if (test "${prefix}" = "NONE"); then
 	dnl no prefix and no localstatedir, so default to /var
 	if (test "$localstatedir" = '${prefix}/var'); then
@@ -385,6 +396,7 @@ AC_SUBST(CONFIGDIR, "${configdir}")
 
 AC_DEFINE_UNQUOTED(MESH_STORAGEDIR, "${storagedir}/mesh",
 			[Directory for the mesh daemon storage files])
+AC_SUBST(MESH_STORAGEDIR, "${storagedir}/mesh")
 
 AC_ARG_ENABLE(android, AC_HELP_STRING([--enable-android],
 			[enable BlueZ for Android]),
@@ -408,4 +420,21 @@ fi
 AC_DEFINE_UNQUOTED(ANDROID_STORAGEDIR, "${storagedir}/android",
 			[Directory for the Android daemon storage files])
 
-AC_OUTPUT(Makefile src/bluetoothd.8 lib/bluez.pc)
+AC_ARG_WITH([phonebook], AC_HELP_STRING([--with-phonebook=PLUGIN],
+				[obexd phonebook plugin (default=dummy)]),
+					[plugin_phonebook=${withval}])
+if (test -z "${plugin_phonebook}"); then
+	plugin_phonebook=dummy
+fi
+
+if (test "${plugin_phonebook}" = "ebook"); then
+	PKG_CHECK_MODULES(LIBEBOOK, [libebook-1.2 >= 3.3], dummy=yes, AC_MSG_ERROR(libebook >= 3.3 is required))
+	AC_SUBST(LIBEBOOK_CFLAGS)
+	AC_SUBST(LIBEBOOK_LIBS)
+	PKG_CHECK_MODULES(LIBEDATESERVER, [libedataserver-1.2 >= 3.3], dummy=yes, AC_MSG_ERROR(libedataserver >= 3.3 is required))
+	AC_SUBST(LIBEDATESERVER_CFLAGS)
+	AC_SUBST(LIBEDATESERVER_LIBS)
+fi
+AC_SUBST(PLUGIN_PHONEBOOK, [${plugin_phonebook}])
+
+AC_OUTPUT(Makefile src/bluetoothd.rst lib/bluez.pc mesh/bluetooth-meshd.rst)

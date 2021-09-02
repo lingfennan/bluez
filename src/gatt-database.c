@@ -699,6 +699,18 @@ static void gap_appearance_read_cb(struct gatt_db_attribute *attrib,
 	gatt_db_attribute_read_result(attrib, id, error, value, len);
 }
 
+static void gap_car_read_cb(struct gatt_db_attribute *attrib,
+					unsigned int id, uint16_t offset,
+					uint8_t opcode, struct bt_att *att,
+					void *user_data)
+{
+	uint8_t value = 0x01;
+
+	DBG("GAP Central Address Resolution read request\n");
+
+	gatt_db_attribute_read_result(attrib, id, 0, &value, sizeof(value));
+}
+
 static sdp_record_t *record_new(uuid_t *uuid, uint16_t start, uint16_t end)
 {
 	sdp_list_t *svclass_id, *apseq, *proto[2], *root, *aproto;
@@ -820,7 +832,7 @@ static void populate_gap_service(struct btd_gatt_database *database)
 
 	/* Add the GAP service */
 	bt_uuid16_create(&uuid, UUID_GAP);
-	service = gatt_db_add_service(database->db, &uuid, true, 5);
+	service = gatt_db_add_service(database->db, &uuid, true, 7);
 
 	/*
 	 * Device Name characteristic.
@@ -841,6 +853,17 @@ static void populate_gap_service(struct btd_gatt_database *database)
 							gap_appearance_read_cb,
 							NULL, database);
 	gatt_db_attribute_set_fixed_length(attrib, 2);
+
+	/*
+	 * Central Address Resolution characteristic.
+	 */
+	bt_uuid16_create(&uuid, GATT_CHARAC_CAR);
+	attrib = gatt_db_service_add_characteristic(service, &uuid,
+							BT_ATT_PERM_READ,
+							BT_GATT_CHRC_PROP_READ,
+							gap_car_read_cb,
+							NULL, database);
+	gatt_db_attribute_set_fixed_length(attrib, 1);
 
 	gatt_db_service_set_active(service, true);
 
@@ -2378,6 +2401,26 @@ static struct pending_op *send_write(struct btd_device *device,
 	return NULL;
 }
 
+static void flush_pending_write(void *data, void *user_data)
+{
+	GDBusProxy *proxy = user_data;
+	struct pending_op *op = data;
+
+	if (g_dbus_proxy_method_call(proxy, "WriteValue", write_setup_cb,
+					write_reply_cb,
+					op, pending_op_free) == TRUE)
+		return;
+
+	pending_op_free(op);
+}
+
+static void flush_pending_writes(GDBusProxy *proxy,
+					struct queue *owner_queue)
+{
+	queue_foreach(owner_queue, flush_pending_write, proxy);
+	queue_remove_all(owner_queue, NULL, NULL, NULL);
+}
+
 static bool sock_hup(struct io *io, void *user_data)
 {
 	struct external_chrc *chrc = user_data;
@@ -2488,18 +2531,19 @@ static void acquire_write_reply(DBusMessage *message, void *user_data)
 
 	chrc->write_io = sock_io_new(fd, chrc);
 
-	if (sock_io_send(chrc->write_io, op->data.iov_base,
-				op->data.iov_len) < 0)
-		goto retry;
+	while ((op = queue_peek_head(chrc->pending_writes)) != NULL) {
+		if (sock_io_send(chrc->write_io, op->data.iov_base,
+					op->data.iov_len) < 0)
+			goto retry;
 
-	gatt_db_attribute_write_result(op->attrib, op->id, 0);
+		gatt_db_attribute_write_result(op->attrib, op->id, 0);
+		pending_op_free(op);
+	}
 
 	return;
 
 retry:
-	send_write(op->device, op->attrib, chrc->proxy, NULL, op->id,
-				op->data.iov_base, op->data.iov_len, 0,
-				op->link_type, false, false);
+	flush_pending_writes(chrc->proxy, chrc->pending_writes);
 }
 
 static void acquire_write_setup(DBusMessageIter *iter, void *user_data)
@@ -2527,14 +2571,18 @@ static struct pending_op *acquire_write(struct external_chrc *chrc,
 					uint8_t link_type)
 {
 	struct pending_op *op;
+	bool acquiring = !queue_isempty(chrc->pending_writes);
 
 	op = pending_write_new(device, chrc->pending_writes, attrib, id, value,
 				len, 0, link_type, false, false);
 
+	if (acquiring)
+		return op;
+
 	if (g_dbus_proxy_method_call(chrc->proxy, "AcquireWrite",
 					acquire_write_setup,
 					acquire_write_reply,
-					op, pending_op_free))
+					op, NULL))
 		return op;
 
 	pending_op_free(op);
@@ -3828,13 +3876,7 @@ void btd_gatt_database_restore_svc_chng_ccc(struct btd_gatt_database *database)
 	 */
 	btd_adapter_for_each_device(database->adapter, restore_state, database);
 
-	/* This needs to be updated (probably to 0x0001) if we ever change
-	 * core services
-	 *
-	 * TODO we could also store this info (along with CCC value) and be able
-	 * to send 0x0001-0xffff only once per device.
-	 */
-	put_le16(0x000a, value);
+	put_le16(0x0001, value);
 	put_le16(0xffff, value + 2);
 
 	send_notification_to_devices(database, handle, value, sizeof(value),

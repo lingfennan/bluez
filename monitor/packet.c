@@ -266,6 +266,8 @@ struct index_data {
 	uint8_t  bdaddr[6];
 	uint16_t manufacturer;
 	uint16_t msft_opcode;
+	uint8_t  msft_evt_prefix[8];
+	uint8_t  msft_evt_len;
 	size_t   frame;
 };
 
@@ -279,6 +281,12 @@ void packet_set_fallback_manufacturer(uint16_t manufacturer)
 		index_list[i].manufacturer = manufacturer;
 
 	fallback_manufacturer = manufacturer;
+}
+
+void packet_set_msft_evt_prefix(const uint8_t *prefix, uint8_t len)
+{
+	if (index_current < MAX_INDEX && len < 8)
+		memcpy(index_list[index_current].msft_evt_prefix, prefix, len);
 }
 
 static void print_packet(struct timeval *tv, struct ucred *cred, char ident,
@@ -713,10 +721,9 @@ static void print_addr_resolve(const char *label, const uint8_t *addr,
 	}
 }
 
-static void print_addr(const char *label, const uint8_t *addr,
-						uint8_t addr_type)
+static void print_addr(const char *label, const uint8_t *addr, uint8_t type)
 {
-	print_addr_resolve(label, addr, addr_type, true);
+	print_addr_resolve(label, addr, type, true);
 }
 
 static void print_bdaddr(const uint8_t *bdaddr)
@@ -2185,10 +2192,7 @@ static void print_adv_filter_policy(const char *label, uint8_t value)
 
 static void print_rssi(int8_t rssi)
 {
-	if ((uint8_t) rssi == 0x99 || rssi == 127)
-		print_field("RSSI: invalid (0x%2.2x)", (uint8_t) rssi);
-	else
-		print_field("RSSI: %d dBm (0x%2.2x)", rssi, (uint8_t) rssi);
+	packet_print_rssi("RSSI", rssi);
 }
 
 static void print_slot_625(const char *label, uint16_t value)
@@ -3285,18 +3289,13 @@ static void print_uuid128_list(const char *label, const void *data,
 {
 	uint8_t count = data_len / 16;
 	unsigned int i;
-	char uuidstr[MAX_LEN_UUID_STR];
 
 	print_field("%s: %u entr%s", label, count, count == 1 ? "y" : "ies");
 
 	for (i = 0; i < count; i++) {
 		const uint8_t *uuid = data + (i * 16);
 
-		sprintf(uuidstr, "%8.8x-%4.4x-%4.4x-%4.4x-%8.8x%4.4x",
-				get_le32(&uuid[12]), get_le16(&uuid[10]),
-				get_le16(&uuid[8]), get_le16(&uuid[6]),
-				get_le32(&uuid[2]), get_le16(&uuid[0]));
-		print_field("  %s (%s)", bt_uuidstr_to_str(uuidstr), uuidstr);
+		print_field("  %s", bt_uuid128_to_str(uuid));
 	}
 }
 
@@ -3788,9 +3787,9 @@ static void print_eir(const uint8_t *eir, uint8_t eir_len, bool le)
 		packet_hexdump(eir, eir_len - len);
 }
 
-void packet_print_addr(const char *label, const void *data, bool random)
+void packet_print_addr(const char *label, const void *data, uint8_t type)
 {
-	print_addr(label ? : "Address", data, random ? 0x01 : 0x00);
+	print_addr(label ? : "Address", data, type);
 }
 
 void packet_print_handle(uint16_t handle)
@@ -3798,9 +3797,13 @@ void packet_print_handle(uint16_t handle)
 	print_handle_native(handle);
 }
 
-void packet_print_rssi(int8_t rssi)
+void packet_print_rssi(const char *label, int8_t rssi)
 {
-	print_rssi(rssi);
+	if ((uint8_t) rssi == 0x99 || rssi == 127)
+		print_field("%s: invalid (0x%2.2x)", label, (uint8_t) rssi);
+	else
+		print_field("%s: %d dBm (0x%2.2x)", label, rssi,
+							(uint8_t) rssi);
 }
 
 void packet_print_ad(const void *data, uint8_t size)
@@ -8067,12 +8070,14 @@ static void print_cis_params_test(const void *data, int i)
 
 	print_field("CIS ID: 0x%2.2x", cis->cis_id);
 	print_field("NSE: 0x%2.2x", cis->nse);
-	print_field("Master to Slave Maximum SDU: 0x%4.4x", cis->m_sdu);
+	print_field("Master to Slave Maximum SDU: 0x%4.4x",
+						le16_to_cpu(cis->m_sdu));
 	print_field("Slave to Master Maximum SDU: 0x%4.4x",
 						le16_to_cpu(cis->s_sdu));
-	print_field("Master to Slave Maximum PDU: 0x%2.2x",
+	print_field("Master to Slave Maximum PDU: 0x%4.4x",
 						le16_to_cpu(cis->m_pdu));
-	print_field("Slave to Master Maximum PDU: 0x%2.2x", cis->s_pdu);
+	print_field("Slave to Master Maximum PDU: 0x%4.4x",
+						le16_to_cpu(cis->s_pdu));
 	print_le_phy("Master to Slave PHY", cis->m_phy);
 	print_le_phy("Slave to Master PHY", cis->s_phy);
 	print_field("Master to Slave Burst Number: 0x%2.2x", cis->m_bn);
@@ -8085,7 +8090,7 @@ static void le_set_cig_params_test_cmd(const void *data, uint8_t size)
 
 	print_field("CIG ID: 0x%2.2x", cmd->cig_id);
 	print_usec_interval("Master to Slave SDU Interval", cmd->m_interval);
-	print_usec_interval("Master to Slave SDU Interval", cmd->s_interval);
+	print_usec_interval("Slave to Master SDU Interval", cmd->s_interval);
 	print_field("Master to Slave Flush Timeout: 0x%2.2x", cmd->m_ft);
 	print_field("Slave to Master Flush Timeout: 0x%2.2x", cmd->s_ft);
 	print_field("ISO Interval: %.2f ms (0x%4.4x)",
@@ -9375,9 +9380,14 @@ static const struct vendor_ocf *current_vendor_ocf(uint16_t ocf)
 	return NULL;
 }
 
-static const struct vendor_evt *current_vendor_evt(uint8_t evt)
+static const struct vendor_evt *current_vendor_evt(const void *data,
+							int *consumed_size)
 {
 	uint16_t manufacturer, msft_opcode;
+	uint8_t evt = *((const uint8_t *) data);
+
+	/* A regular vendor event consumes 1 byte. */
+	*consumed_size = 1;
 
 	if (index_current < MAX_INDEX) {
 		manufacturer = index_list[index_current].manufacturer;
@@ -9392,7 +9402,7 @@ static const struct vendor_evt *current_vendor_evt(uint8_t evt)
 
 	switch (manufacturer) {
 	case 2:
-		return intel_vendor_evt(evt);
+		return intel_vendor_evt(data, consumed_size);
 	case 15:
 		return broadcom_vendor_evt(evt);
 	}
@@ -10597,7 +10607,7 @@ static void le_ext_adv_report_evt(const void *data, uint8_t size)
 			print_field("  RSSI: reserved (0x%2.2x)",
 							(uint8_t) report->rssi);
 
-		print_slot_125("  Periodic advertising invteral",
+		print_slot_125("  Periodic advertising interval",
 							report->interval);
 		print_peer_addr_type("  Direct address type",
 						report->direct_addr_type);
@@ -10606,6 +10616,7 @@ static void le_ext_adv_report_evt(const void *data, uint8_t size)
 		print_field("  Data length: 0x%2.2x", report->data_len);
 		data += sizeof(struct bt_hci_le_ext_adv_report);
 		packet_hexdump(data, report->data_len);
+		print_eir(data, report->data_len, true);
 		data += report->data_len;
 	}
 }
@@ -10624,7 +10635,7 @@ static void le_per_adv_sync(const void *data, uint8_t size)
 	print_peer_addr_type("Advertiser address type", evt->addr_type);
 	print_addr("Advertiser address", evt->addr, evt->addr_type);
 	print_le_phy("Advertiser PHY", evt->phy);
-	print_slot_125("Periodic advertising invteral", evt->interval);
+	print_slot_125("Periodic advertising interval", evt->interval);
 	print_field("Advertiser clock accuracy: 0x%2.2x", evt->clock_accuracy);
 }
 
@@ -11011,10 +11022,10 @@ static void le_meta_event_evt(const void *data, uint8_t size)
 
 static void vendor_evt(const void *data, uint8_t size)
 {
-	uint8_t subevent = *((const uint8_t *) data);
 	struct subevent_data vendor_data;
 	char vendor_str[150];
-	const struct vendor_evt *vnd = current_vendor_evt(subevent);
+	int consumed_size;
+	const struct vendor_evt *vnd = current_vendor_evt(data, &consumed_size);
 
 	if (vnd) {
 		const char *str = current_vendor_str();
@@ -11025,12 +11036,13 @@ static void vendor_evt(const void *data, uint8_t size)
 			vendor_data.str = vendor_str;
 		} else
 			vendor_data.str = vnd->str;
-		vendor_data.subevent = subevent;
+		vendor_data.subevent = vnd->evt;
 		vendor_data.func = vnd->evt_func;
 		vendor_data.size = vnd->evt_size;
 		vendor_data.fixed = vnd->evt_fixed;
 
-		print_subevent(&vendor_data, data + 1, size - 1);
+		print_subevent(&vendor_data, data + consumed_size,
+							size - consumed_size);
 	} else {
 		uint16_t manufacturer;
 
@@ -12005,16 +12017,6 @@ static void mgmt_print_name(const void *data)
 	print_field("Short name: %s", (char *) (data + 249));
 }
 
-static void mgmt_print_uuid(const void *data)
-{
-	const uint8_t *uuid = data;
-
-	print_field("UUID: %8.8x-%4.4x-%4.4x-%4.4x-%8.8x%4.4x",
-				get_le32(&uuid[12]), get_le16(&uuid[10]),
-				get_le16(&uuid[8]), get_le16(&uuid[6]),
-				get_le32(&uuid[2]), get_le16(&uuid[0]));
-}
-
 static void mgmt_print_io_capability(uint8_t capability)
 {
 	const char *str;
@@ -12044,9 +12046,10 @@ static void mgmt_print_io_capability(uint8_t capability)
 }
 
 static const struct bitfield_data mgmt_device_flags_table[] = {
-	{  0, "Confirm Name"	},
-	{  1, "Legacy Pairing"	},
-	{  2, "Not Connectable"	},
+	{  0, "Confirm Name"			},
+	{  1, "Legacy Pairing"			},
+	{  2, "Not Connectable"			},
+	{  3, "Connection Locally Initiated"	},
 	{ }
 };
 
@@ -12260,7 +12263,7 @@ static void mgmt_print_exp_feature(const void *data)
 	uint32_t flags = get_le32(data + 16);
 	uint32_t mask;
 
-	mgmt_print_uuid(data);
+	print_field("UUID: %s", bt_uuid128_to_str(data));
 	print_field("Flags: 0x%8.8x", flags);
 
 	mask = print_bitfield(2, flags, mgmt_exp_feature_flags_table);
@@ -12456,7 +12459,7 @@ static void mgmt_add_uuid_cmd(const void *data, uint16_t size)
 {
 	uint8_t service_class = get_u8(data + 16);
 
-	mgmt_print_uuid(data);
+	print_field("UUID: %s", bt_uuid128_to_str(data));
 	print_field("Service class: 0x%2.2x", service_class);
 }
 
@@ -12467,7 +12470,7 @@ static void mgmt_add_uuid_rsp(const void *data, uint16_t size)
 
 static void mgmt_remove_uuid_cmd(const void *data, uint16_t size)
 {
-	mgmt_print_uuid(data);
+	print_field("UUID: %s", bt_uuid128_to_str(data));
 }
 
 static void mgmt_remove_uuid_rsp(const void *data, uint16_t size)
@@ -13091,7 +13094,7 @@ static void mgmt_start_service_discovery_cmd(const void *data, uint16_t size)
 	}
 
 	for (i = 0; i < num_uuids; i++)
-		mgmt_print_uuid(data + 4 + (i * 16));
+		print_field("UUID: %s", bt_uuid128_to_str(data + 4 + (i * 16)));
 }
 
 static void mgmt_start_service_discovery_rsp(const void *data, uint16_t size)
@@ -13351,7 +13354,7 @@ static void mgmt_set_exp_feature_cmd(const void *data, uint16_t size)
 {
 	uint8_t enable = get_u8(data + 16);
 
-	mgmt_print_uuid(data);
+	print_field("UUID: %s", bt_uuid128_to_str(data));
 	print_enable("Action", enable);
 }
 
